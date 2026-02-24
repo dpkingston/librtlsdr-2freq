@@ -16,6 +16,33 @@
  * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
 
+/*
+ * 2-frequency continuous alternating mode
+ * ----------------------------------------
+ * Based on DC9ST/librtlsdr-2freq (2017) and ported to osmocom rtl-sdr 2.0.2.
+ *
+ * When two -f arguments are given, the RTL-SDR alternates between two
+ * frequencies indefinitely, outputting blocks of exactly -n samples at each
+ * frequency in turn:
+ *
+ *   [freq1 block 0][freq2 block 0][freq1 block 1][freq2 block 1] ...
+ *
+ * The ADC sample clock runs continuously with no gaps.  The tuner switch
+ * (I2C command to the R820T) happens at the start of each block.  The first
+ * ~10-40 ms of each block contains settling artefacts; callers should discard
+ * a configurable number of "settling samples" at the start of each block.
+ *
+ * This mode is designed for single-dongle TDOA direction finding where an
+ * FM broadcast station (sync channel) and an LMR target channel are
+ * monitored on a single RTL-SDR.  See TDOAv3 for the full system.
+ *
+ * Usage (2-frequency mode):
+ *   rtl_sdr -f <freq1_hz> -f <freq2_hz> -s <rate> -g <gain> -n <samples_per_block> -
+ *
+ * Usage (standard single-frequency mode — identical to upstream rtl_sdr):
+ *   rtl_sdr -f <freq_hz> [-s rate] [-g gain] [-n total_samples] <filename>
+ */
+
 #include <errno.h>
 #include <signal.h>
 #include <string.h>
@@ -43,20 +70,38 @@ static int do_exit = 0;
 static uint32_t bytes_to_read = 0;
 static rtlsdr_dev_t *dev = NULL;
 
+/* 2-frequency alternating mode state */
+static uint32_t freq_count = 0;          /* number of -f arguments seen (1 or 2) */
+static uint32_t frequency1 = 100000000;  /* first frequency (sync / reference) */
+static uint32_t frequency2 = 100000000;  /* second frequency (target) */
+static uint32_t bytes_per_block = 0;     /* bytes per frequency block; 0 = single-freq mode */
+static uint32_t bytes_in_block = 0;      /* bytes written into the current block */
+static int current_freq_idx = 0;         /* 0 = frequency1, 1 = frequency2 */
+
 void usage(void)
 {
 	fprintf(stderr,
-		"rtl_sdr, an I/Q recorder for RTL2832 based DVB-T receivers\n\n"
-		"Usage:\t -f frequency_to_tune_to [Hz]\n"
+		"rtl_sdr — I/Q recorder for RTL2832 based DVB-T receivers\n"
+		"2-frequency continuous alternating mode for TDOA (osmocom 2.0.2 port)\n\n"
+		"Single-frequency mode (standard):\n"
+		"  rtl_sdr -f <freq_hz> [-s rate] [-g gain] [-n total_samples] <filename>\n\n"
+		"2-frequency alternating mode (TDOA):\n"
+		"  rtl_sdr -f <freq1_hz> -f <freq2_hz> -s <rate> -g <gain> -n <samples_per_block> -\n\n"
+		"  Outputs blocks of <samples_per_block> IQ samples alternating between freq1 and\n"
+		"  freq2 indefinitely: [freq1][freq2][freq1][freq2]...\n"
+		"  The ADC clock runs continuously; no samples are dropped on tuner switches.\n"
+		"  Discard the first N settling samples of each block in the caller.\n\n"
+		"Options:\n"
+		"\t-f frequency [Hz]  (specify twice for 2-frequency mode)\n"
 		"\t[-s samplerate (default: 2048000 Hz)]\n"
 		"\t[-d device_index or serial (default: 0)]\n"
 		"\t[-g gain (default: 0 for auto)]\n"
 		"\t[-p ppm_error (default: 0)]\n"
-		"\t[-b output_block_size (default: 16 * 16384)]\n"
-		"\t[-n number of samples to read (default: 0, infinite)]\n"
+		"\t[-b output_block_size (default: auto in 2-freq mode, 16*16384 otherwise)]\n"
+		"\t[-n number of samples: total count in single-freq, per-block in 2-freq]\n"
 		"\t[-S force sync output (default: async)]\n"
 		"\t[-D enable direct sampling (default: off)]\n"
-		"\tfilename (a '-' dumps samples to stdout)\n\n");
+		"\tfilename (use '-' to dump samples to stdout)\n\n");
 	exit(1);
 }
 
@@ -101,6 +146,27 @@ static void rtlsdr_callback(unsigned char *buf, uint32_t len, void *ctx)
 
 		if (bytes_to_read > 0)
 			bytes_to_read -= len;
+
+		/*
+		 * 2-frequency alternating: switch tuner at each block boundary.
+		 *
+		 * Because out_block_size is set equal to bytes_per_block (see main),
+		 * each libusb callback delivers exactly bytes_per_block bytes, so
+		 * bytes_in_block + len == bytes_per_block exactly on every call.
+		 * The frequency switch fires after the full block has been written,
+		 * so the data in this buffer is entirely at the old frequency.
+		 * The *next* callback's data starts with tuner settling artefacts
+		 * (callers discard settling_samples from the start of each block).
+		 */
+		if (bytes_per_block > 0) {
+			bytes_in_block += len;
+			if (bytes_in_block >= bytes_per_block) {
+				bytes_in_block = 0;
+				current_freq_idx ^= 1;
+				verbose_set_frequency(dev,
+					current_freq_idx ? frequency2 : frequency1);
+			}
+		}
 	}
 }
 
@@ -116,11 +182,11 @@ int main(int argc, char **argv)
 	int ppm_error = 0;
 	int direct_sampling = 0;
 	int sync_mode = 0;
+	int blocksize_given = 0;
 	FILE *file;
 	uint8_t *buffer;
 	int dev_index = 0;
 	int dev_given = 0;
-	uint32_t frequency = 100000000;
 	uint32_t samp_rate = DEFAULT_SAMPLE_RATE;
 	uint32_t out_block_size = DEFAULT_BUF_LENGTH;
 
@@ -131,7 +197,15 @@ int main(int argc, char **argv)
 			dev_given = 1;
 			break;
 		case 'f':
-			frequency = (uint32_t)atofs(optarg);
+			if (freq_count == 0)
+				frequency1 = (uint32_t)atofs(optarg);
+			else if (freq_count == 1)
+				frequency2 = (uint32_t)atofs(optarg);
+			else {
+				fprintf(stderr, "Error: at most two -f arguments are supported\n");
+				usage();
+			}
+			freq_count++;
 			break;
 		case 'g':
 			gain = (int)(atof(optarg) * 10); /* tenths of a dB */
@@ -144,6 +218,7 @@ int main(int argc, char **argv)
 			break;
 		case 'b':
 			out_block_size = (uint32_t)atof(optarg);
+			blocksize_given = 1;
 			break;
 		case 'n':
 			bytes_to_read = (uint32_t)atof(optarg) * 2;
@@ -166,8 +241,42 @@ int main(int argc, char **argv)
 		filename = argv[optind];
 	}
 
-	if(out_block_size < MINIMAL_BUF_LENGTH ||
-	   out_block_size > MAXIMAL_BUF_LENGTH ){
+	/*
+	 * Mode selection: if two -f arguments were given, enter 2-frequency
+	 * continuous alternating mode.
+	 *
+	 * In this mode:
+	 *   - bytes_to_read (from -n) is repurposed as the block size in bytes.
+	 *   - bytes_to_read is then cleared so the binary runs indefinitely.
+	 *   - out_block_size is set equal to bytes_per_block so that each libusb
+	 *     callback delivers exactly one block, giving clean block boundaries.
+	 */
+	if (freq_count >= 2) {
+		if (bytes_to_read == 0) {
+			fprintf(stderr,
+				"Error: -n <samples_per_block> is required in 2-frequency mode\n");
+			usage();
+		}
+		bytes_per_block = bytes_to_read;
+		bytes_to_read = 0;  /* run indefinitely */
+
+		/* Align libusb transfer size to block size for exact boundaries */
+		if (!blocksize_given) {
+			out_block_size = bytes_per_block;
+		}
+
+		fprintf(stderr,
+			"2-frequency alternating mode:\n"
+			"  Freq1 (sync):   %.6f MHz\n"
+			"  Freq2 (target): %.6f MHz\n"
+			"  Block size:     %u samples (%u bytes)\n"
+			"  Running indefinitely — send SIGTERM or Ctrl-C to stop\n",
+			frequency1 / 1e6, frequency2 / 1e6,
+			bytes_per_block / 2, bytes_per_block);
+	}
+
+	if (out_block_size < MINIMAL_BUF_LENGTH ||
+	    out_block_size > MAXIMAL_BUF_LENGTH) {
 		fprintf(stderr,
 			"Output block size wrong value, falling back to default\n");
 		fprintf(stderr,
@@ -205,17 +314,17 @@ int main(int argc, char **argv)
 #endif
 
 	/* Set direct sampling */
-        if (direct_sampling)
-                verbose_direct_sampling(dev, 2);
+	if (direct_sampling)
+		verbose_direct_sampling(dev, 2);
 
 	/* Set the sample rate */
 	verbose_set_sample_rate(dev, samp_rate);
 
-	/* Set the frequency */
-	verbose_set_frequency(dev, frequency);
+	/* Set the initial frequency */
+	verbose_set_frequency(dev, frequency1);
 
 	if (0 == gain) {
-		 /* Enable automatic gain */
+		/* Enable automatic gain */
 		verbose_auto_gain(dev);
 	} else {
 		/* Enable manual gain */
@@ -225,7 +334,7 @@ int main(int argc, char **argv)
 
 	verbose_ppm_set(dev, ppm_error);
 
-	if(strcmp(filename, "-") == 0) { /* Write samples to stdout */
+	if (strcmp(filename, "-") == 0) { /* Write samples to stdout */
 		file = stdout;
 #ifdef _WIN32
 		_setmode(_fileno(stdin), _O_BINARY);
@@ -283,7 +392,7 @@ int main(int argc, char **argv)
 		fclose(file);
 
 	rtlsdr_close(dev);
-	free (buffer);
+	free(buffer);
 out:
 	return r >= 0 ? r : -r;
 }
