@@ -210,9 +210,9 @@ freq_hop:
   rtl_sdr_binary: "/usr/local/bin/rtl_sdr_2freq"
   samples_per_block: 32768           # sync block (~16 ms)
   target_samples_per_block: 65536    # target block (~32 ms) — optional
-  settling_samples: 24576            # ~12 ms; measure with measure_settling.py
+  settling_samples: 49152            # ~24 ms; measured with measure_settling.py
 ```
 
 With the reduced USB pipeline (4 × 8 kB = 16 ms vs former 15 × 8 kB = 60 ms),
-the recommended `settling_samples` drops from ~180 000 to ~25 000, making
-asymmetric mode with 32 768-sample sync blocks (>25 000 settling) viable.
+the recommended `settling_samples` drops from ~180 000 to ~50 000, making
+asymmetric mode with 65 536-sample sync blocks viable.
