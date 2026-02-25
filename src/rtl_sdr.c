@@ -31,12 +31,15 @@
  * Two -n: channels use different sizes (asymmetric), e.g. a short sync block
  * and a long target block for higher target duty cycle.
  *
- * The libusb transfer size is set to GCD(block1, block2) so every callback
- * boundary is a block boundary for at least one channel.  The frequency
- * switch fires after the last callback of a complete block.
+ * The libusb transfer size (out_block_size) is set to
+ * GCD(GCD(block1, block2), 16384) bytes, which is the largest value that
+ * divides both block sizes while staying ≤ 16 kB.  Keeping transfers small
+ * reduces the USB pipeline depth after each hop (stale data from the previous
+ * frequency), cutting per-hop settling from ~60 ms to ~16 ms.  buf_num is
+ * reduced from the default 15 to 4 in 2-freq mode for the same reason.
  *
  * The ADC clock runs continuously; no samples are lost on tuner switches.
- * The first ~10-40 ms of each block contains R820T PLL settling artefacts;
+ * The first ~10-25 ms of each block contains R820T PLL settling artefacts;
  * callers must discard a configurable number of "settling samples" per block.
  *
  * Usage (symmetric 2-frequency mode):
@@ -308,18 +311,29 @@ int main(int argc, char **argv)
 
 		if (!blocksize_given) {
 			out_block_size = gcd_u32(bytes_per_block[0], bytes_per_block[1]);
+			/*
+			 * Cap the USB transfer size at 16 kB (= GCD with 16384).
+			 * This preserves exact block-boundary alignment while keeping
+			 * transfers small, which reduces the number of stale samples
+			 * buffered in the USB pipeline after each frequency hop.
+			 * Combined with buf_num=4 below, the pipeline stale-data window
+			 * is ~4 * 8192 = 32768 samples (~16 ms at 2.048 MSPS), vs the
+			 * default ~15 * 8192 = ~60 ms with the librtlsdr defaults.
+			 */
+			out_block_size = gcd_u32(out_block_size, 16384);
 		}
 
 		fprintf(stderr,
-			"2-frequency alternating mode:\n"
+			"2-frequency alternating mode%s:\n"
 			"  Freq1 (sync):   %.6f MHz  block %u samples (%u bytes)\n"
 			"  Freq2 (target): %.6f MHz  block %u samples (%u bytes)\n"
-			"  USB xfer size:  %u bytes%s\n"
+			"  USB xfer size:  %u bytes, 4 buffers (~%u ms pipeline)\n"
 			"  Running indefinitely — send SIGTERM or Ctrl-C to stop\n",
+			(bytes_per_block[0] != bytes_per_block[1]) ? " [asymmetric]" : "",
 			frequency1 / 1e6, bytes_per_block[0] / 2, bytes_per_block[0],
 			frequency2 / 1e6, bytes_per_block[1] / 2, bytes_per_block[1],
 			out_block_size,
-			(bytes_per_block[0] != bytes_per_block[1]) ? "  [asymmetric]" : "");
+			(4u * (out_block_size / 2u)) * 1000u / 2048000u);
 	}
 
 	if (out_block_size < MINIMAL_BUF_LENGTH ||
@@ -427,7 +441,7 @@ int main(int argc, char **argv)
 	} else {
 		fprintf(stderr, "Reading samples in async mode...\n");
 		r = rtlsdr_read_async(dev, rtlsdr_callback, (void *)file,
-				      0, out_block_size);
+				      freq_count >= 2 ? 4 : 0, out_block_size);
 	}
 
 	if (do_exit)

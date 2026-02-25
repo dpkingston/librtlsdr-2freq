@@ -163,8 +163,13 @@ Only `src/rtl_sdr.c` is modified (the library itself, `librtlsdr.c`, is
 - `-n` option: accumulates up to two values (first → freq1, second → freq2)
 - Mode detection after getopt: if `freq_count >= 2`, set per-channel block sizes
   from `-n` values and clear `bytes_to_read` for infinite operation
-- `out_block_size` auto-set to `GCD(block1, block2)` in 2-freq mode;
-  overridable with `-b`
+- `out_block_size` auto-set to `GCD(GCD(block1, block2), 16384)` in 2-freq
+  mode — preserves exact block boundaries while capping each USB transfer at
+  16 kB to reduce per-hop pipeline stale data; overridable with `-b`
+- `buf_num` set to 4 (not the librtlsdr default 15) in 2-freq mode — with
+  16 kB transfers, 4 × 8192 = 32768 samples ≈ 16 ms of pipeline lag after
+  each hop, vs 15 × 8192 ≈ 60 ms with the defaults; settling_samples in
+  TDOAv3 can be reduced from ~180 000 to ~30 000 accordingly
 - `rtlsdr_callback`: block-boundary frequency switch using per-channel threshold
 - Updated `usage()` documenting symmetric and asymmetric modes
 
@@ -177,7 +182,8 @@ Only `src/rtl_sdr.c` is modified (the library itself, `librtlsdr.c`, is
 | Second frequency flag | `-h <freq>` | Second `-f <freq>` (standard interface) |
 | `-n` meaning | Samples per freq (total = 3×n) | Samples per block per channel (runs forever) |
 | Asymmetric block sizes | Not supported | Two `-n` args: first → freq1, second → freq2 |
-| Block size alignment | Caller-managed | Auto: `out_block_size = GCD(block1, block2)` |
+| Block size alignment | Caller-managed | Auto: `out_block_size = GCD(GCD(block1, block2), 16384)` |
+| USB buffer count | Default (15) | 4 in 2-freq mode for lower hop latency |
 | Direct sampling (`-D`) | Not present | Inherited from upstream |
 | Signal pipe handling | Missing `SIG_IGN` | Correct (`signal(SIGPIPE, SIG_IGN)`) |
 
@@ -202,7 +208,11 @@ Configure in TDOAv3's `config/node.yaml`:
 ```yaml
 freq_hop:
   rtl_sdr_binary: "/usr/local/bin/rtl_sdr_2freq"
-  samples_per_block: 16384           # sync block (~8 ms)
+  samples_per_block: 32768           # sync block (~16 ms)
   target_samples_per_block: 65536    # target block (~32 ms) — optional
-  settling_samples: 8192
+  settling_samples: 24576            # ~12 ms; measure with measure_settling.py
 ```
+
+With the reduced USB pipeline (4 × 8 kB = 16 ms vs former 15 × 8 kB = 60 ms),
+the recommended `settling_samples` drops from ~180 000 to ~25 000, making
+asymmetric mode with 32 768-sample sync blocks (>25 000 settling) viable.
