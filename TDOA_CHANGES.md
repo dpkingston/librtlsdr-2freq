@@ -14,57 +14,76 @@ version was a one-shot capture (freq1 → freq2 → freq1, three blocks total) b
 on a ~2014 vintage of the library.
 
 This fork ports the approach to the current osmocom rtl-sdr 2.0.2 codebase and
-extends it to **continuous indefinite alternating**, which is required for live
-TDOA monitoring.
+extends it with:
+
+- **Continuous indefinite alternating** — required for live TDOA monitoring
+- **Asymmetric block sizes** — different block sizes for each channel, enabling
+  higher target duty cycle
 
 ## How It Works
 
 When two `-f` arguments are given, `rtl_sdr` enters 2-frequency mode:
 
 1. Tunes to `freq1` and starts the async capture stream.
-2. After exactly `-n` samples have been written, switches the tuner to `freq2`.
-3. After the next `-n` samples, switches back to `freq1`.
+2. After `freq1_block_samples` samples have been written, switches to `freq2`.
+3. After `freq2_block_samples` samples, switches back to `freq1`.
 4. Repeats indefinitely until SIGTERM / Ctrl-C.
 
-The libusb transfer size is automatically set equal to the block byte length
-(`-n` samples × 2 bytes/sample) so that each libusb callback delivers exactly
-one complete block.  The tuner switch fires after the callback writes its data,
-so all data in any given callback is at a single frequency.
+The libusb transfer size (`out_block_size`) is set to
+`GCD(freq1_block_bytes, freq2_block_bytes)` so that every callback boundary
+aligns with a block boundary for at least one channel.  The tuner switch fires
+after the last callback that completes a block.
 
 The first portion of each block contains R820T PLL settling artefacts.  Callers
 must discard a configurable number of **settling samples** at the start of each
-block (typically 20–40 ms worth; measure with `scripts/measure_settling.py` in
-TDOAv3).
+block (typically 20–40 ms; measure empirically with
+`scripts/measure_settling.py` in TDOAv3).
 
-Output stream layout:
+## Command-Line Interface
+
+### `-f` argument
+
+Specify twice.  The **first** `-f` is `freq1` (typically the FM sync station);
+the **second** `-f` is `freq2` (the LMR target).
+
+### `-n` argument
+
+Specify **once** for symmetric mode (same block size on both channels), or
+**twice** for asymmetric mode.  The **first** `-n` sets the block size for
+`freq1`; the **second** `-n` sets the block size for `freq2`.
 
 ```
-[freq1 block 0 | freq2 block 0 | freq1 block 1 | freq2 block 1 | ...]
- <-- N samples --> <-- N samples --> <-- N samples --> ...
+# Argument ordering:
+-f <freq1>  -f <freq2>  -n <freq1_samples>  [-n <freq2_samples>]
 ```
+
+This mirrors the natural pairing of `-f` and `-n` by position: the Nth `-n`
+applies to the Nth `-f`.
+
+### Output stream layout
+
+**Symmetric** (`-n 65536`):
+
+```
+[freq1: 65536 samp | freq2: 65536 samp | freq1: 65536 samp | ...]
+  ~32 ms             ~32 ms              ~32 ms
+```
+
+**Asymmetric** (`-n 16384 -n 65536`):
+
+```
+[freq1: 16384 | freq2: 65536 | freq1: 16384 | freq2: 65536 | ...]
+   ~8 ms         ~32 ms          ~8 ms          ~32 ms
+```
+
+Asymmetric example gives ~80% target duty cycle vs 50% symmetric.
 
 Each block: first ~20 ms settling artefacts, then stable signal at that
 frequency.
 
-## Changes from osmocom 2.0.2
+## Usage Examples
 
-Only `src/rtl_sdr.c` is modified (the library itself, `librtlsdr.c`, is
-**unchanged**).  The patch adds:
-
-- `freq_count`, `frequency1`, `frequency2` globals — track two `-f` arguments
-- `bytes_per_block`, `bytes_in_block`, `current_freq_idx` globals — block state
-- `blocksize_given` flag — avoid overriding an explicit `-b`
-- `-f` option: accumulates up to two frequencies instead of overwriting
-- Mode detection after getopt: if `freq_count >= 2`, repurpose `-n` as block
-  size and clear `bytes_to_read` for infinite operation
-- `out_block_size` auto-set to `bytes_per_block` in 2-freq mode (for exact
-  block alignment); overridable with `-b`
-- `rtlsdr_callback`: added block-boundary frequency switch
-- Updated `usage()` documenting both modes
-
-## Usage
-
-### 2-frequency mode (TDOA)
+### Symmetric 2-frequency mode (50/50 duty cycle)
 
 ```bash
 # Alternate between KISW 99.9 MHz (sync) and 155.1 MHz (LMR target)
@@ -78,15 +97,30 @@ rtl_sdr \
     -
 ```
 
-Output goes to stdout as a continuous stream of raw uint8 IQ pairs
-(I, Q interleaved, 0–255, DC at 127.5), block-alternating between the
-two frequencies.
+### Asymmetric 2-frequency mode (higher target duty cycle)
+
+```bash
+# 16384 sync samples (~8 ms) + 65536 target samples (~32 ms)
+# → ~80% of usable time on target channel
+rtl_sdr \
+    -f 99900000 \
+    -f 155100000 \
+    -s 2048000 \
+    -g 400 \
+    -n 16384 \
+    -n 65536 \
+    -
+```
 
 ### Single-frequency mode (unchanged from upstream)
 
 ```bash
 rtl_sdr -f 99900000 -s 2048000 -g 0 -n 2048000 output.bin
 ```
+
+Output goes to stdout as a continuous stream of raw uint8 IQ pairs
+(I, Q interleaved, 0–255, DC at 127.5), block-alternating between the
+two frequencies.
 
 ## Building
 
@@ -115,6 +149,25 @@ Same as upstream osmocom rtl-sdr:
 sudo apt install libusb-1.0-0-dev cmake build-essential
 ```
 
+## Changes from osmocom 2.0.2
+
+Only `src/rtl_sdr.c` is modified (the library itself, `librtlsdr.c`, is
+**unchanged**).  The patch adds:
+
+- `freq_count`, `frequency1`, `frequency2` globals — track two `-f` arguments
+- `n_count`, `n_samples[2]` globals — accumulate up to two `-n` arguments
+- `bytes_per_block[2]`, `bytes_in_block`, `current_freq_idx` — block state
+- `blocksize_given` flag — avoid overriding an explicit `-b`
+- `gcd_u32()` helper — compute USB transfer size for asymmetric blocks
+- `-f` option: accumulates up to two frequencies instead of overwriting
+- `-n` option: accumulates up to two values (first → freq1, second → freq2)
+- Mode detection after getopt: if `freq_count >= 2`, set per-channel block sizes
+  from `-n` values and clear `bytes_to_read` for infinite operation
+- `out_block_size` auto-set to `GCD(block1, block2)` in 2-freq mode;
+  overridable with `-b`
+- `rtlsdr_callback`: block-boundary frequency switch using per-channel threshold
+- Updated `usage()` documenting symmetric and asymmetric modes
+
 ## Differences from DC9ST/librtlsdr-2freq
 
 | Feature | DC9ST (2017) | This fork |
@@ -122,18 +175,34 @@ sudo apt install libusb-1.0-0-dev cmake build-essential
 | Base library | ~2014 osmocom + async_rearrangement | osmocom 2.0.2 (Feb 2026) |
 | Capture mode | One-shot: freq1 → freq2 → freq1 (3 blocks) | Continuous: alternates indefinitely |
 | Second frequency flag | `-h <freq>` | Second `-f <freq>` (standard interface) |
-| `-n` meaning | Samples per freq (total = 3×n) | Samples per block (runs forever) |
-| Block size alignment | Caller-managed | Auto: `out_block_size = bytes_per_block` |
+| `-n` meaning | Samples per freq (total = 3×n) | Samples per block per channel (runs forever) |
+| Asymmetric block sizes | Not supported | Two `-n` args: first → freq1, second → freq2 |
+| Block size alignment | Caller-managed | Auto: `out_block_size = GCD(block1, block2)` |
 | Direct sampling (`-D`) | Not present | Inherited from upstream |
 | Signal pipe handling | Missing `SIG_IGN` | Correct (`signal(SIGPIPE, SIG_IGN)`) |
 
 ## Integration with TDOAv3
 
-TDOAv3's `FreqHopReceiver` already generates the correct command line:
+TDOAv3's `FreqHopReceiver` generates the correct command line automatically,
+using two `-n` arguments when `target_samples_per_block` differs from
+`samples_per_block`:
 
 ```
-rtl_sdr -f <sync_freq> -f <target_freq> -s <rate> -g <gain*10> -n <block_samples> -
+# Symmetric:
+rtl_sdr -f <sync_freq> -f <target_freq> -s <rate> -g <gain*10> \
+        -n <block_samples> -n <block_samples> -
+
+# Asymmetric:
+rtl_sdr -f <sync_freq> -f <target_freq> -s <rate> -g <gain*10> \
+        -n <sync_samples> -n <target_samples> -
 ```
 
-No changes to TDOAv3 are required.  Set `freq_hop.rtl_sdr_binary` in
-`config/node.yaml` to point to this binary.
+Configure in TDOAv3's `config/node.yaml`:
+
+```yaml
+freq_hop:
+  rtl_sdr_binary: "/usr/local/bin/rtl_sdr_2freq"
+  samples_per_block: 16384           # sync block (~8 ms)
+  target_samples_per_block: 65536    # target block (~32 ms) — optional
+  settling_samples: 8192
+```

@@ -22,22 +22,30 @@
  * Based on DC9ST/librtlsdr-2freq (2017) and ported to osmocom rtl-sdr 2.0.2.
  *
  * When two -f arguments are given, the RTL-SDR alternates between two
- * frequencies indefinitely, outputting blocks of exactly -n samples at each
- * frequency in turn:
+ * frequencies indefinitely:
  *
  *   [freq1 block 0][freq2 block 0][freq1 block 1][freq2 block 1] ...
  *
- * The ADC sample clock runs continuously with no gaps.  The tuner switch
- * (I2C command to the R820T) happens at the start of each block.  The first
- * ~10-40 ms of each block contains settling artefacts; callers should discard
- * a configurable number of "settling samples" at the start of each block.
+ * Each -f argument has a corresponding -n argument for its block size.
+ * One -n: both channels use the same size (symmetric, 50/50 duty cycle).
+ * Two -n: channels use different sizes (asymmetric), e.g. a short sync block
+ * and a long target block for higher target duty cycle.
  *
- * This mode is designed for single-dongle TDOA direction finding where an
- * FM broadcast station (sync channel) and an LMR target channel are
- * monitored on a single RTL-SDR.  See TDOAv3 for the full system.
+ * The libusb transfer size is set to GCD(block1, block2) so every callback
+ * boundary is a block boundary for at least one channel.  The frequency
+ * switch fires after the last callback of a complete block.
  *
- * Usage (2-frequency mode):
- *   rtl_sdr -f <freq1_hz> -f <freq2_hz> -s <rate> -g <gain> -n <samples_per_block> -
+ * The ADC clock runs continuously; no samples are lost on tuner switches.
+ * The first ~10-40 ms of each block contains R820T PLL settling artefacts;
+ * callers must discard a configurable number of "settling samples" per block.
+ *
+ * Usage (symmetric 2-frequency mode):
+ *   rtl_sdr -f <freq1_hz> -f <freq2_hz> -s <rate> -g <gain> \
+ *           -n <samples_per_block> -
+ *
+ * Usage (asymmetric 2-frequency mode):
+ *   rtl_sdr -f <freq1_hz> -f <freq2_hz> -s <rate> -g <gain> \
+ *           -n <freq1_samples> -n <freq2_samples> -
  *
  * Usage (standard single-frequency mode — identical to upstream rtl_sdr):
  *   rtl_sdr -f <freq_hz> [-s rate] [-g gain] [-n total_samples] <filename>
@@ -71,12 +79,14 @@ static uint32_t bytes_to_read = 0;
 static rtlsdr_dev_t *dev = NULL;
 
 /* 2-frequency alternating mode state */
-static uint32_t freq_count = 0;          /* number of -f arguments seen (1 or 2) */
-static uint32_t frequency1 = 100000000;  /* first frequency (sync / reference) */
-static uint32_t frequency2 = 100000000;  /* second frequency (target) */
-static uint32_t bytes_per_block = 0;     /* bytes per frequency block; 0 = single-freq mode */
-static uint32_t bytes_in_block = 0;      /* bytes written into the current block */
-static int current_freq_idx = 0;         /* 0 = frequency1, 1 = frequency2 */
+static uint32_t freq_count = 0;              /* number of -f arguments seen (1 or 2) */
+static uint32_t frequency1 = 100000000;      /* first frequency  (sync / reference) */
+static uint32_t frequency2 = 100000000;      /* second frequency (target) */
+static uint32_t n_count = 0;                 /* number of -n arguments seen (1 or 2) */
+static uint32_t n_samples[2] = {0, 0};       /* stored -n values (samples, not bytes) */
+static uint32_t bytes_per_block[2] = {0, 0}; /* bytes per block [freq1, freq2]; 0 = single-freq */
+static uint32_t bytes_in_block = 0;          /* bytes accumulated in the current block */
+static int current_freq_idx = 0;             /* 0 = frequency1, 1 = frequency2 */
 
 void usage(void)
 {
@@ -85,24 +95,36 @@ void usage(void)
 		"2-frequency continuous alternating mode for TDOA (osmocom 2.0.2 port)\n\n"
 		"Single-frequency mode (standard):\n"
 		"  rtl_sdr -f <freq_hz> [-s rate] [-g gain] [-n total_samples] <filename>\n\n"
-		"2-frequency alternating mode (TDOA):\n"
-		"  rtl_sdr -f <freq1_hz> -f <freq2_hz> -s <rate> -g <gain> -n <samples_per_block> -\n\n"
-		"  Outputs blocks of <samples_per_block> IQ samples alternating between freq1 and\n"
-		"  freq2 indefinitely: [freq1][freq2][freq1][freq2]...\n"
+		"2-frequency alternating mode — symmetric (same block size on both channels):\n"
+		"  rtl_sdr -f <freq1_hz> -f <freq2_hz> -s <rate> -g <gain> \\\n"
+		"          -n <samples_per_block> -\n\n"
+		"2-frequency alternating mode — asymmetric (different block sizes):\n"
+		"  rtl_sdr -f <freq1_hz> -f <freq2_hz> -s <rate> -g <gain> \\\n"
+		"          -n <freq1_samples> -n <freq2_samples> -\n\n"
+		"  -f is given twice: first value = freq1 (sync/FM), second = freq2 (target).\n"
+		"  -n is given once for symmetric mode, or twice for asymmetric mode.\n"
+		"  First -n matches first -f; second -n matches second -f.\n"
 		"  The ADC clock runs continuously; no samples are dropped on tuner switches.\n"
 		"  Discard the first N settling samples of each block in the caller.\n\n"
 		"Options:\n"
-		"\t-f frequency [Hz]  (specify twice for 2-frequency mode)\n"
+		"\t-f frequency [Hz]          (specify twice for 2-frequency mode)\n"
+		"\t-n samples                 (specify twice in 2-freq mode for asymmetric blocks)\n"
 		"\t[-s samplerate (default: 2048000 Hz)]\n"
 		"\t[-d device_index or serial (default: 0)]\n"
 		"\t[-g gain (default: 0 for auto)]\n"
 		"\t[-p ppm_error (default: 0)]\n"
 		"\t[-b output_block_size (default: auto in 2-freq mode, 16*16384 otherwise)]\n"
-		"\t[-n number of samples: total count in single-freq, per-block in 2-freq]\n"
 		"\t[-S force sync output (default: async)]\n"
 		"\t[-D enable direct sampling (default: off)]\n"
 		"\tfilename (use '-' to dump samples to stdout)\n\n");
 	exit(1);
+}
+
+/* Euclidean GCD for uint32_t — used to compute USB transfer size. */
+static uint32_t gcd_u32(uint32_t a, uint32_t b)
+{
+	while (b) { uint32_t t = b; b = a % b; a = t; }
+	return a;
 }
 
 #ifdef _WIN32
@@ -150,17 +172,23 @@ static void rtlsdr_callback(unsigned char *buf, uint32_t len, void *ctx)
 		/*
 		 * 2-frequency alternating: switch tuner at each block boundary.
 		 *
-		 * Because out_block_size is set equal to bytes_per_block (see main),
-		 * each libusb callback delivers exactly bytes_per_block bytes, so
-		 * bytes_in_block + len == bytes_per_block exactly on every call.
+		 * out_block_size = GCD(bytes_per_block[0], bytes_per_block[1]),
+		 * so each libusb callback delivers an exact divisor of both block
+		 * sizes.  bytes_in_block accumulates until it reaches the threshold
+		 * for the current channel, at which point the tuner switches.
+		 *
+		 * For symmetric blocks GCD == block size, so the switch fires every
+		 * callback (same as before).  For asymmetric blocks the switch fires
+		 * after the appropriate number of callbacks for each channel.
+		 *
 		 * The frequency switch fires after the full block has been written,
-		 * so the data in this buffer is entirely at the old frequency.
-		 * The *next* callback's data starts with tuner settling artefacts
+		 * so all data in any given block is at a single frequency.
+		 * The *next* block starts with tuner settling artefacts
 		 * (callers discard settling_samples from the start of each block).
 		 */
-		if (bytes_per_block > 0) {
+		if (bytes_per_block[0] > 0) {
 			bytes_in_block += len;
-			if (bytes_in_block >= bytes_per_block) {
+			if (bytes_in_block >= bytes_per_block[current_freq_idx]) {
 				bytes_in_block = 0;
 				current_freq_idx ^= 1;
 				verbose_set_frequency(dev,
@@ -221,7 +249,15 @@ int main(int argc, char **argv)
 			blocksize_given = 1;
 			break;
 		case 'n':
-			bytes_to_read = (uint32_t)atof(optarg) * 2;
+			if (n_count == 0)
+				n_samples[0] = (uint32_t)atof(optarg);
+			else if (n_count == 1)
+				n_samples[1] = (uint32_t)atof(optarg);
+			else {
+				fprintf(stderr, "Error: at most two -n arguments are supported\n");
+				usage();
+			}
+			n_count++;
 			break;
 		case 'S':
 			sync_mode = 1;
@@ -242,37 +278,48 @@ int main(int argc, char **argv)
 	}
 
 	/*
-	 * Mode selection: if two -f arguments were given, enter 2-frequency
-	 * continuous alternating mode.
+	 * Single-frequency mode: bytes_to_read comes from the first (only) -n.
+	 * 2-frequency mode repurposes -n as per-channel block sizes below.
+	 */
+	if (n_count >= 1)
+		bytes_to_read = n_samples[0] * 2;
+
+	/*
+	 * Mode selection: two -f arguments → 2-frequency continuous alternating.
 	 *
-	 * In this mode:
-	 *   - bytes_to_read (from -n) is repurposed as the block size in bytes.
-	 *   - bytes_to_read is then cleared so the binary runs indefinitely.
-	 *   - out_block_size is set equal to bytes_per_block so that each libusb
-	 *     callback delivers exactly one block, giving clean block boundaries.
+	 * -n may be given once (symmetric: same block size for both channels) or
+	 * twice (asymmetric: first -n for freq1/sync, second -n for freq2/target).
+	 * bytes_to_read is cleared so the binary runs indefinitely.
+	 *
+	 * out_block_size is set to GCD(block0_bytes, block1_bytes) so that every
+	 * libusb callback boundary is a block boundary for at least one channel.
+	 * For symmetric blocks GCD == block size (identical to symmetric behaviour).
 	 */
 	if (freq_count >= 2) {
-		if (bytes_to_read == 0) {
+		if (n_count == 0) {
 			fprintf(stderr,
-				"Error: -n <samples_per_block> is required in 2-frequency mode\n");
+				"Error: -n <samples_per_block> is required in 2-frequency mode\n"
+				"       Use -n once for symmetric blocks, twice for asymmetric.\n");
 			usage();
 		}
-		bytes_per_block = bytes_to_read;
+		bytes_per_block[0] = n_samples[0] * 2;
+		bytes_per_block[1] = (n_count >= 2 ? n_samples[1] : n_samples[0]) * 2;
 		bytes_to_read = 0;  /* run indefinitely */
 
-		/* Align libusb transfer size to block size for exact boundaries */
 		if (!blocksize_given) {
-			out_block_size = bytes_per_block;
+			out_block_size = gcd_u32(bytes_per_block[0], bytes_per_block[1]);
 		}
 
 		fprintf(stderr,
 			"2-frequency alternating mode:\n"
-			"  Freq1 (sync):   %.6f MHz\n"
-			"  Freq2 (target): %.6f MHz\n"
-			"  Block size:     %u samples (%u bytes)\n"
+			"  Freq1 (sync):   %.6f MHz  block %u samples (%u bytes)\n"
+			"  Freq2 (target): %.6f MHz  block %u samples (%u bytes)\n"
+			"  USB xfer size:  %u bytes%s\n"
 			"  Running indefinitely — send SIGTERM or Ctrl-C to stop\n",
-			frequency1 / 1e6, frequency2 / 1e6,
-			bytes_per_block / 2, bytes_per_block);
+			frequency1 / 1e6, bytes_per_block[0] / 2, bytes_per_block[0],
+			frequency2 / 1e6, bytes_per_block[1] / 2, bytes_per_block[1],
+			out_block_size,
+			(bytes_per_block[0] != bytes_per_block[1]) ? "  [asymmetric]" : "");
 	}
 
 	if (out_block_size < MINIMAL_BUF_LENGTH ||
