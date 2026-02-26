@@ -110,12 +110,13 @@ static volatile uint32_t   retune_freq  = 0;  /* 0 = no pending retune */
 
 static void *retune_worker(void *arg)
 {
+	uint32_t freq;
 	(void)arg;
 	while (!do_exit) {
 		pthread_mutex_lock(&retune_mutex);
 		while (retune_freq == 0 && !do_exit)
 			pthread_cond_wait(&retune_cond, &retune_mutex);
-		uint32_t freq = retune_freq;
+		freq = retune_freq;
 		retune_freq = 0;
 		pthread_mutex_unlock(&retune_mutex);
 		if (freq != 0)
