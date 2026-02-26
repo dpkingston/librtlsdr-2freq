@@ -62,6 +62,7 @@
 
 #ifndef _WIN32
 #include <unistd.h>
+#include <pthread.h>
 #else
 #include <windows.h>
 #include <io.h>
@@ -90,6 +91,39 @@ static uint32_t n_samples[2] = {0, 0};       /* stored -n values (samples, not b
 static uint32_t bytes_per_block[2] = {0, 0}; /* bytes per block [freq1, freq2]; 0 = single-freq */
 static uint32_t bytes_in_block = 0;          /* bytes accumulated in the current block */
 static int current_freq_idx = 0;             /* 0 = frequency1, 1 = frequency2 */
+
+/*
+ * Retune worker thread — performs the actual rtlsdr_set_center_freq() call
+ * outside of the libusb async callback context.
+ *
+ * Calling verbose_set_frequency() (which issues a synchronous USB control
+ * transfer) from inside the libusb async bulk-transfer callback causes
+ * LIBUSB_ERROR_BUSY (-6): the event loop is already running and cannot
+ * service a nested synchronous transfer.  The fix is to signal a dedicated
+ * thread that performs the retune after the callback returns.
+ */
+#ifndef _WIN32
+static pthread_t           retune_thread;
+static pthread_mutex_t     retune_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t      retune_cond  = PTHREAD_COND_INITIALIZER;
+static volatile uint32_t   retune_freq  = 0;  /* 0 = no pending retune */
+
+static void *retune_worker(void *arg)
+{
+	(void)arg;
+	while (!do_exit) {
+		pthread_mutex_lock(&retune_mutex);
+		while (retune_freq == 0 && !do_exit)
+			pthread_cond_wait(&retune_cond, &retune_mutex);
+		uint32_t freq = retune_freq;
+		retune_freq = 0;
+		pthread_mutex_unlock(&retune_mutex);
+		if (freq != 0)
+			verbose_set_frequency(dev, freq);
+	}
+	return NULL;
+}
+#endif
 
 void usage(void)
 {
@@ -194,8 +228,19 @@ static void rtlsdr_callback(unsigned char *buf, uint32_t len, void *ctx)
 			if (bytes_in_block >= bytes_per_block[current_freq_idx]) {
 				bytes_in_block = 0;
 				current_freq_idx ^= 1;
+#ifndef _WIN32
+				/* Signal the retune worker thread.  Cannot call
+				 * verbose_set_frequency() here directly: it issues a
+				 * synchronous libusb control transfer from inside the
+				 * async bulk callback, which returns LIBUSB_ERROR_BUSY. */
+				pthread_mutex_lock(&retune_mutex);
+				retune_freq = current_freq_idx ? frequency2 : frequency1;
+				pthread_cond_signal(&retune_cond);
+				pthread_mutex_unlock(&retune_mutex);
+#else
 				verbose_set_frequency(dev,
 					current_freq_idx ? frequency2 : frequency1);
+#endif
 			}
 		}
 	}
@@ -440,8 +485,20 @@ int main(int argc, char **argv)
 		}
 	} else {
 		fprintf(stderr, "Reading samples in async mode...\n");
+#ifndef _WIN32
+		if (freq_count >= 2)
+			pthread_create(&retune_thread, NULL, retune_worker, NULL);
+#endif
 		r = rtlsdr_read_async(dev, rtlsdr_callback, (void *)file,
 				      freq_count >= 2 ? 4 : 0, out_block_size);
+#ifndef _WIN32
+		if (freq_count >= 2) {
+			pthread_mutex_lock(&retune_mutex);
+			pthread_cond_signal(&retune_cond);  /* wake worker so it sees do_exit */
+			pthread_mutex_unlock(&retune_mutex);
+			pthread_join(retune_thread, NULL);
+		}
+#endif
 	}
 
 	if (do_exit)
